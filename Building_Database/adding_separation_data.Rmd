@@ -1,0 +1,193 @@
+---
+title: "Separation_Notebook"
+author: "Jarrod Pelkofer"
+date: "10/31/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# load libraries
+```{r}
+library(tidyverse)
+library(lubridate)
+library(DataExplorer)
+library(DBI)
+library(RPostgres)
+
+
+# connect to db
+con <- dbConnect(drv = RPostgres::Postgres(), 
+                 user = "postgres", 
+                 password = keyring::key_get("postgres_db", "postgres"), 
+                 dbname = "big_data_bowl_db")
+```
+
+
+# Database connections
+```{r cache=TRUE}
+
+# con is my database connection
+tracking_data <- tbl(con, "tracking_tbl")
+pbp_data <- tbl(con, "plays_tbl")
+games_data <- tbl(con, "games_tbl")
+
+```
+
+
+# Function to get separation per play, per frame
+```{r}
+get_separtion_metrics <- function(play_data_df) {
+  
+  
+  # data frame of only defense players
+  def_team_df <- 
+  play_data_df %>% 
+  filter(on_defense == 1) %>% 
+  select(
+         # play description columns
+         time, play_description, quarter, down, yards_to_go, possession_team, defensive_team, 
+         yardline_side:visitor_team_abbr, 
+         # frame/ event cols
+         frame_id, event, 
+         # defensive player columns
+         nfl_id_def = nfl_id, def_player_name = display_name, def_jersey_num = jersey_number, def_pos = position, 
+         team_def = team, x_def = x, y_def = y, s_def = s, a_def = a, dis_def = dis
+         )
+  
+  # data frame of only offense players
+  off_team_df <- 
+  play_data_df %>% 
+  filter(on_defense == 0) %>% 
+  select(
+         # frame
+         frame_id,
+         # offensive player columns
+         nfl_id_off = nfl_id, off_player_name = display_name, off_jersey_num = jersey_number, off_pos = position,
+         team_off = team, x_off = x, y_off = y, s_off = s, a_off = a, dis_off = dis, route 
+        )
+  
+  # join data on frame id, calculate distance defensive player is from each offensive player
+  distance_to_opp_df <- 
+  def_team_df %>% 
+  left_join(off_team_df, by =  "frame_id") %>% 
+  mutate(distance_from_opponent = 
+           sqrt(
+             (x_def - x_off)^2 + (y_def - y_off)^2
+               )
+         ) 
+
+  return(distance_to_opp_df)
+  
+}
+
+# test on single play
+# play_data_joined %>%
+#   filter(play_id %in% c("2958")) %>%
+#   get_separtion_metrics()
+# 
+# # test map to multiple plays
+# play_data_nested %>% 
+#   sample_n(5) %>% 
+#   mutate(separation_data = map(play_data, ~ get_separtion_metrics(.x))) %>%
+#   select(-play_data) %>% 
+#   unnest(separation_data)
+
+
+```
+
+
+# Pull games in chunks from database
+```{r}
+
+# individual game ids
+game_ids <- games_data %>% 
+  select(game_id) %>% 
+  distinct() %>% 
+  pull()
+
+
+  # game_ids_10 <- game_ids[c(1:10)]
+  # game_ids_10 <- game_ids[c(11:20)]
+  # game_ids_10 <- game_ids[c(21:30)]
+  # game_ids_10 <- game_ids[c(31:40)]
+  # game_ids_10 <- game_ids[c(41:50)]
+  # game_ids_10 <- game_ids[c(51:60)]
+  # game_ids_10 <- game_ids[c(61:70)]
+  # game_ids_10 <- game_ids[c(71:80)]
+  # game_ids_10 <- game_ids[c(81:90)]
+  # game_ids_10 <- game_ids[c(91:100)]
+  # game_ids_10 <- game_ids[c(101:110)]
+  # game_ids_10 <- game_ids[c(111:120)]
+  # game_ids_10 <- game_ids[c(121:130)]
+  # game_ids_10 <- game_ids[c(131:140)]
+  # game_ids_10 <- game_ids[c(141:150)]
+  # game_ids_10 <- game_ids[c(151:160)]
+  # game_ids_10 <- game_ids[c(161:170)]
+  # game_ids_10 <- game_ids[c(171:180)]
+  # game_ids_10 <- game_ids[c(181:190)]
+  # game_ids_10 <- game_ids[c(191:200)]
+  # game_ids_10 <- game_ids[c(201:210)]
+  # game_ids_10 <- game_ids[c(211:220)]
+  # game_ids_10 <- game_ids[c(221:230)]
+  # game_ids_10 <- game_ids[c(231:240)]
+  # game_ids_10 <- game_ids[c(241:250)]
+  # game_ids_10 <- game_ids[c(251:253)]
+```
+
+# Pull Data from DB, Clean Data, Write new data to DB
+```{r}
+
+# join datasets together, code if a player is a defensive player
+play_data_joined <-
+  
+  tracking_data %>%
+  filter(game_id %in% c(game_ids_10)) %>%
+  left_join(pbp_data, by = c("game_id",
+                             "play_id")) %>%
+  left_join(games_data %>% select(game_id, home_team_abbr, visitor_team_abbr),
+            by = "game_id") %>%
+  # defensive team = home or away?
+  mutate(
+    defensive_team = if_else(
+      possession_team == home_team_abbr,
+      visitor_team_abbr,
+      home_team_abbr
+    )
+  ) %>%
+  # code if player is on defense
+  mutate(
+    on_defense = case_when(
+      defensive_team == visitor_team_abbr & team %in% c("away") ~ 1,
+      defensive_team == home_team_abbr & team %in% c("home") ~ 1,
+      TRUE ~ 0
+    )
+  ) %>%
+  collect()
+
+# Nest Data by game_id, play_id
+play_data_nested <- play_data_joined %>% 
+  nest(play_data = c(-game_id, -play_id))
+
+# create new dataframe with separation metrics
+separation_data_df <- play_data_nested %>% 
+  mutate(separation_data = map(play_data, ~ get_separtion_metrics(.x))) %>% 
+  select(-play_data) %>% 
+  unnest(separation_data)
+
+# Create new table in database and write first set of plays with separtation data added
+# separation_data_df %>% 
+#   DBI::dbWriteTable(conn = con, "separation_data_tbl", ., row.names = FALSE, overwrite = TRUE)
+
+# add new separation data
+separation_data_df %>% 
+  DBI::dbAppendTable(conn = con, "separation_data_tbl", .)
+```
+
+
+```{r}
+separation_data <- tbl(con, "separation_data_tbl")
+```
+

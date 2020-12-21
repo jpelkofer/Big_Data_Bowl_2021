@@ -1,0 +1,126 @@
+---
+title: "Standardize Direction and Orientation"
+author: "Jarrod Pelkofer"
+date: "12/1/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(plotly)
+library(DBI)
+library(RPostgres)
+
+
+#connect to db
+con <- dbConnect(drv = RPostgres::Postgres(), 
+                 user = "postgres", 
+                 password = keyring::key_get("postgres_db", "postgres"), 
+                 dbname = "big_data_bowl_db")
+```
+
+# Get Data from DB
+```{r}
+tracking_tbl <- tbl(con, "tracking_tbl")
+
+tracking_df <- tracking_tbl %>% 
+  collect()
+
+```
+
+# Evaluate Plays to left and right
+```{r}
+play_and_player_nested <- tracking_df %>% 
+  nest(-c(game_id, play_id, nfl_id))
+
+one_play_nested <- play_and_player_nested %>% 
+  filter(game_id %in% c("2018092305") & play_id %in% c("1780")
+         )
+
+one_play_nested_dir_right <- play_and_player_nested %>% 
+  filter(game_id %in% c("2018122201") & play_id %in% c("3649"))
+
+         
+# direction right play
+one_play_nested_dir_right %>% 
+  unnest(data) %>% 
+  ggplot(aes(dir)) +
+  geom_histogram()
+
+g1 <- one_play_nested_dir_right %>%
+  filter(nfl_id %in% c(2560757)) %>%
+  unnest(data) %>% 
+  filter(frame_id > 10) %>% 
+  mutate(label = str_glue("dir: {dir}\no: {o}")) %>% 
+  ggplot(aes(x, y)) +
+  geom_point(aes(text = label))
+
+
+ggplotly(g1)
+                  
+# direction left play
+one_play_nested %>% 
+  unnest(data)
+
+g2 <- one_play_nested %>% 
+  filter(nfl_id %in% c(2543801)) %>% 
+  unnest(data) %>% 
+  mutate(dir = case_when(
+    dir > 180 ~ dir - 180,
+    dir < 90 ~ dir + 180,
+    dir >= 90 & dir <= 180 ~ dir + 180,
+    TRUE ~ dir
+  )) %>%
+  filter(frame_id >11) %>%
+  mutate(label = str_glue("dir: {dir}\no: {o}")) %>%
+  ggplot(aes(x, y)) +
+  geom_point(aes(text = label)) +
+  #scale_x_continuous(limits = c(0, 120)) + 
+  scale_y_continuous(limits = c(0, 53.3))
+
+ggplotly(g2)
+
+```
+
+# Standardize direction and Orientation on All Plays
+```{r}
+tracking_dir_and_o_fixed <- 
+  tracking_df %>%
+  filter(play_direction %in% c("left")) %>%
+  mutate(dir = case_when(
+    dir > 180 ~ dir - 180,
+    dir < 90 ~ dir + 180,
+    dir >= 90 & dir <= 180 ~ dir + 180,
+    TRUE ~ dir
+  )) %>%
+  mutate(o = case_when(
+    o > 180 ~ o - 180,
+    o < 90 ~ o + 180,
+    o >= 90 & o <= 180 ~ o + 180,
+    TRUE ~ o
+  ))
+
+tracking_play_right_df <- 
+  tracking_df %>% 
+  filter(play_direction %in% c("right"))
+
+tracking_data_standardized <- 
+  tracking_dir_and_o_fixed %>% 
+  bind_rows(tracking_play_right_df)
+
+write_csv(tracking_data_standardized, "tracking_data_standarized.csv")
+
+tracking_data_standardized <- read_csv("tracking_data_standarized.csv")
+```
+
+# Update tracking table in database
+```{r}
+# tracking data
+tracking_data_standardized %>% 
+  DBI::dbWriteTable(conn = con, "tracking_tbl", ., row.names = FALSE, overwrite = TRUE)
+```
+

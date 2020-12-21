@@ -1,0 +1,351 @@
+---
+title: "Untitled"
+author: "Jarrod Pelkofer"
+date: "10/21/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries and Connect to DB
+```{r}
+library(tidyverse)
+library(lubridate)
+library(DataExplorer)
+library(DBI)
+library(RPostgres)
+
+
+#connect to db
+con <- dbConnect(drv = RPostgres::Postgres(), 
+                 user = "postgres", 
+                 password = keyring::key_get("postgres_db", "postgres"), 
+                 dbname = "big_data_bowl_db")
+```
+
+# Read in data
+All data comes from <https://www.kaggle.com/c/nfl-big-data-bowl-2021/data>
+```{r}
+#* schedule info for games ----
+df_games <- read_csv("data/games.csv",
+                     col_types = cols())
+#* play-by-play info ----
+df_plays <- read_csv("data/plays.csv")
+
+#* background info for players ----
+df_players <- read_csv("data/players.csv")
+
+df_targeted_receiver <- read_csv("data/targetedReceiver.csv")
+
+
+# Read in Tracking Data ----
+weeks <- seq(1, 17)
+
+#* blank df to store tracking data ----
+df_tracking <- data.frame()
+
+#* iterate through all weeks ----
+for(w in weeks){
+  
+  df_tracking_temp <- read_csv(paste0("data/week", w, ".csv"),
+                               col_types = cols())
+  
+  df_tracking <- bind_rows(df_tracking_temp, df_tracking)
+}
+
+# Standardize the Tracking Data ----
+df_tracking <- df_tracking %>% 
+  mutate(x = ifelse(playDirection == "left", 120-x, x),
+         y = ifelse(playDirection == "left", 160/3 - y, y))
+```
+
+
+# View Structure of Datasets
+```{r}
+list <-  list(df_players, df_games, df_plays, df_targeted_receiver, df_tracking)
+
+plot_str(list)
+```
+
+# Cleaning up players table
+```{r}
+
+# clean up birthdates
+df_players_1 <- df_players %>% 
+  janitor::clean_names() %>% 
+  mutate(birth_date = birth_date %>% mdy()) %>% 
+  drop_na()
+
+df_players_2 <- df_players %>% 
+  janitor::clean_names() %>% 
+  mutate(birth_date = birth_date %>% ymd()) %>% 
+  drop_na()
+
+df_players <- df_players_1 %>% 
+  bind_rows(df_players_2)
+
+df_players %>% 
+  plot_missing()
+
+df_players %>% 
+  plot_str()
+
+# with this plot we notice height measurements in different formats
+df_players %>% 
+  plot_bar()
+
+# fix height
+df_players <- 
+  df_players %>% 
+  separate(height, into = c("feet", "inches"), sep = "-", remove = FALSE) %>% 
+  mutate(feet = feet %>% as.numeric(),
+         inches = inches %>% as.numeric()) %>% 
+  mutate(inches = replace_na(inches, 0)) %>% 
+  mutate(feet = case_when(
+    feet < 7 ~ feet * 12,
+    TRUE ~ feet
+  )) %>% 
+  mutate(height = feet + inches) %>% 
+  select(-c(feet, inches))
+
+df_players %>% 
+  plot_histogram()
+
+df_players %>% 
+  select(-nfl_id) %>% 
+  plot_boxplot(by = "position")
+
+
+
+```
+
+# Explore Games Table
+```{r}
+
+# no missing data
+df_games %>% 
+  plot_missing()
+
+df_games %>% glimpse()
+
+df_games %>% 
+  plot_bar()
+
+df_games %>% 
+  plot_histogram()
+
+```
+
+# Explore/Clean Plays Table
+```{r}
+df_plays <- df_plays %>% 
+  janitor::clean_names()
+
+df_plays %>% 
+  plot_missing()
+
+#these were actually rush plays and can be dropped
+df_plays %>% 
+  filter(is.na(pass_result))
+
+df_plays_cleaned <- df_plays %>% 
+  filter(!is.na(pass_result))
+
+df_plays_cleaned %>% 
+  plot_missing()
+
+# the result of these plays are offsetting penalties
+df_plays_cleaned %>% 
+  filter(is.na(personnel_d))
+
+# fake FGs and punts
+df_plays_cleaned %>% 
+  filter(is.na(defenders_in_the_box))
+
+# spiked ball or fake FGs and punts
+df_plays_cleaned %>% 
+  filter(is.na(offense_formation))
+
+# plays that happen at 50 yardline
+df_plays_cleaned %>% 
+  filter(is.na(yardline_side))
+
+# plays that all resulted in no play due to penalty
+df_plays_cleaned %>% 
+  filter(is.na(number_of_pass_rushers))
+
+# plays that all resulted in no play due to penalty (this includes columns game_clock, home_score, visitor_score, type_dropback)
+df_plays_cleaned %>% 
+  filter(is.na(absolute_yardline_number))
+```
+
+# Explore Targeted Receiver Table
+```{r}
+df_targeted_receiver <- df_targeted_receiver %>% 
+  janitor::clean_names()
+
+df_targeted_receiver %>% 
+  plot_missing()
+
+df_targeted_receiver %>% 
+  filter(game_id %in% c(2018100706, 2018102109) & play_id %in% c(690, 2662))
+
+# missing plays not in plays dataset, will drop from targeted receiver dataset
+df_plays_cleaned %>% 
+  filter(game_id %in% c(2018100706, 2018102109) & play_id %in% c(690, 2662))
+
+df_targeted_receiver <- df_targeted_receiver %>% 
+  drop_na(target_nfl_id)
+```
+
+# Explore Player Tracking Table
+```{r}
+df_tracking %>% 
+  introduce()
+
+# 72% missing route
+df_tracking %>% 
+  plot_missing()
+```
+
+
+# Write the tables
+```{r}
+
+# games
+df_games <- df_games %>%
+  janitor::clean_names() %>%
+  mutate(game_date = game_date %>% mdy()) %>%
+  DBI::dbWriteTable(conn = con, "games_tbl", ., field.types = c(game_date = "date"), row.names = FALSE, overwrite = TRUE)
+
+# players
+df_players %>% 
+  DBI::dbWriteTable(conn = con, "players_tbl", ., row.names = FALSE, overwrite = TRUE)
+
+# plays
+df_plays %>% 
+  DBI::dbWriteTable(conn = con, "plays_tbl", ., row.names = FALSE, overwrite = TRUE)
+
+# targeted receiver
+df_targeted_receiver %>% 
+  DBI::dbWriteTable(conn = con, "targeted_rec_tbl", ., row.names = FALSE, overwrite = TRUE)
+
+# tracking data
+df_tracking %>% 
+  DBI::dbWriteTable(conn = con, "tracking_tbl", ., row.names = FALSE, overwrite = TRUE)
+
+
+# add nflfastR pbp data from 2018 season
+pbp_2018 <- read_rds(url("https://raw.githubusercontent.com/guga31bb/nflfastR-data/master/data/play_by_play_2018.rds"))
+
+pbp_2018 %>% 
+  DBI::dbWriteTable(conn = con, "nflfastR_tbl", ., row.names = FALSE, overwrite = TRUE)
+
+```
+
+
+
+# Unnecesary Work (But good practice)
+#* See Which Players are Missing Birthdates
+```{r}
+
+missing_birthdates_df <- df_players %>%
+  janitor::clean_names() %>%
+  mutate(birth_date = birth_date %>% ymd()) %>%
+  filter(is.na(birth_date)) %>%
+  separate(
+    display_name,
+    into = c("first", "last"),
+    sep = " ",
+    remove = FALSE
+  ) %>%
+  mutate(last_initial = last %>% str_sub(1, 1),
+         first_two = first %>% str_sub(1, 2),
+         last_four = last %>% str_sub(1, 4)) %>% 
+  mutate(pfr_id = str_glue("{last_four}{first_two}00"))
+```
+
+
+#* Scrape Pro Football Reference for Missing Birthdates
+```{r}
+library(rvest)
+
+get_birthdates <- function(last_initial, pfr_id){
+  
+  url <- paste0("https://www.pro-football-reference.com/players/", last_initial, "/", pfr_id, ".htm")
+  webpage <- read_html(url)
+  
+  birthdate <- webpage %>% 
+  html_node("span#necro-birth") %>%
+  html_attr("data-birth")
+  
+  missing_birthdate <- tibble(
+    pfr_id     = pfr_id,
+    birth_date = birthdate
+  )
+  
+  Sys.sleep(1)
+  
+  return(missing_birthdate)
+  
+}
+
+
+fill_missing_birthdates_df <- missing_birthdates_df %>% 
+  select(last_initial, pfr_id) %>% 
+  pmap_df(purrr::possibly(get_birthdates, otherwise = c(birthdate = NA)))
+```
+
+#* See which birthdates are still missing and manaully update
+```{r}
+
+all_birthdates_updated_df <- missing_birthdates_df %>%
+  select(-birth_date) %>% 
+  bind_cols(select(fill_missing_birthdates_df, birth_date)) %>% 
+  mutate(birth_date = case_when(
+    display_name == "Corey Graham" ~ "1985-07-25",
+    display_name == "Eric Weddle" ~ "1985-01-04",
+    display_name == "Seth DeValve" ~ "1993-01-29",
+    display_name == "Brian Orakpo" ~ "1986-07-31",
+    display_name == "T.J. McDonald" ~ "1991-01-26",
+    display_name == "Connor Barwin" ~ "1986-10-15",
+    display_name == "Barry Church" ~ "1988-02-11",
+    display_name == "Captain Munnerlyn" ~ "1988-04-10",
+    display_name == "Glover Quin" ~ "1986-01-15",
+    display_name == "Leon Hall" ~ "1984-12-09",
+    display_name == "Reggie Nelson" ~ "1983-09-21",
+    display_name == "Vontae Davis" ~ "1988-05-27",
+    display_name == "Orlando Scandrick" ~ "1987-02-10",
+    display_name == "Adam Jones" ~ "1983-09-30",
+    display_name == "Brandon Wilds" ~ "1993-07-22",
+    display_name == "Tre Madden" ~ "1993-08-16",
+    display_name == "Brent Grimes" ~ "1983-07-19",
+    display_name == "Eric Lee" ~ "1994-08-06",
+    display_name == "Nicholas Grigsby" ~ "1992-07-02",
+    display_name == "Nate Stupar" ~ "1988-03-14",
+    display_name == "Shane Ray" ~ "1993-05-18",
+    display_name == "Vincent Rey" ~ "1987-09-06",
+    display_name == "Andre Hal" ~ "1992-05-30",
+    display_name == "Dymonte Thomas" ~ "1993-11-30",
+    display_name == "Cassanova McKinzy" ~ "1992-11-17",
+    display_name == "Ricky Jean Francois" ~ "1986-11-23",
+    display_name == "Byron Marshall" ~ "1994-02-13",
+    display_name == "Bobo Wilson" ~ "1995-01-25",
+    display_name == "Eric Berry" ~ "1988-12-29",
+    display_name == "Joshua Holsey" ~ "1994-06-25",
+    display_name == "Julius Peppers" ~ "1980-01-18",
+    display_name == "D'Onta Foreman" ~ "1996-04-24",
+    display_name == "Alonzo Russell" ~ "1992-09-29",
+    display_name == "Andrew East" ~ "1991-09-17",
+    TRUE ~ birth_date
+  )) %>% 
+  select(nfl_id:weight, birth_date, college_name:display_name)
+
+
+```
+
+
+
+
