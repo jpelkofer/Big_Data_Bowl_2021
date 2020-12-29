@@ -1,0 +1,574 @@
+---
+title: "Penalty Analysis"
+author: "Jarrod Pelkofer"
+date: "11/13/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Load Libraries and Connect to DB
+```{r}
+# Core
+library(tidyverse)
+
+# Time Series
+library(timetk)
+library(lubridate)
+
+# Database
+library(DBI)
+library(RPostgres)
+
+theme_set(theme_minimal())
+
+
+#connect to db
+con <- dbConnect(drv = RPostgres::Postgres(), 
+                 user = "postgres", 
+                 password = keyring::key_get("postgres_db", "postgres"), 
+                 dbname = "big_data_bowl_db")
+```
+
+# Database table connections
+```{r}
+
+separation_data <- tbl(con, "separation_data_tbl")
+pbp_data <- tbl(con, "plays_tbl")
+games_data <- tbl(con, "games_tbl")
+fastR_data <- tbl(con, "nflfastR_tbl")
+players_tbl <- tbl(con, "players_tbl")
+tracking_tbl <- tbl(con, "tracking_tbl")
+
+separation_data %>% 
+  glimpse()
+
+player_data <- players_tbl %>% 
+  collect()
+
+tracking_tbl %>% 
+  filter(play_id == 51, game_id == 2018123002, frame_id ==1)
+
+dbDisconnect(con)
+
+```
+
+# Pull Data from database
+```{r}
+
+penalty_plays <- pbp_data %>% 
+  select(game_id, play_id, penalty_codes, penalty_jersey_numbers) %>% 
+  filter(!is.na(penalty_codes)) %>% 
+  collect()
+
+nfl_fastR_data <- fastR_data %>%
+  select(old_game_id, play_id, posteam, defteam) %>% 
+  collect()
+
+games_tbl <- games_data %>% collect()
+
+players_df <- players_tbl %>% 
+  collect()
+
+write_csv(games_tbl, "games_tbl.csv")
+write_csv(players_df, "players_df.csv")
+write_csv(penalty_plays, "penalty_plays.csv")
+
+```
+
+# Clean Penalties Data
+```{r warning=FALSE}
+
+# penalty codes of interest
+pen_codes <- c("ICT", "DH", "DPI", "OPI")
+
+# this will be to join with separation data
+penalties_cleaned_df_wide <- penalty_plays %>% 
+  separate(penalty_codes, into = c("pen_1", "pen_2", "pen_3"), sep = ";") %>% 
+  separate(penalty_jersey_numbers, into = c("pen_1_jersey", "pen_2_jersey", "pen_3_jersey"), sep = ";") %>% 
+  separate(pen_1_jersey, into = c("pen_1_team", "pen_1_jersey"), sep = " ") %>% 
+  separate(pen_2_jersey, into = c("pen_2_team", "pen_2_jersey"), sep = " ") %>%
+  separate(pen_3_jersey, into = c("pen_3_team", "pen_3_jersey"), sep = " ")
+
+
+
+penalties_cleaned_df_long <-
+  penalties_cleaned_df_wide %>%
+  select(
+    game_id,
+    play_id,
+    penalty = pen_1,
+    penalty_team = pen_1_team,
+    penalty_jersey = pen_1_jersey
+  ) %>%
+  bind_rows(
+    select(
+      penalties_cleaned_df_wide,
+      game_id,
+      play_id,
+      penalty = pen_2,
+      penalty_team = pen_2_team,
+      penalty_jersey = pen_2_jersey
+    )
+  ) %>%
+  bind_rows(
+    select(
+      penalties_cleaned_df_wide,
+      game_id,
+      play_id,
+      penalty = pen_3,
+      penalty_team = pen_3_team,
+      penalty_jersey = pen_3_jersey
+    )
+  ) %>%
+  drop_na() %>%
+  filter(penalty %in% c(pen_codes)) %>%
+  left_join(games_tbl) %>%
+  mutate(
+    posteam = case_when(
+      penalty_team == home_team_abbr & penalty == "OPI" ~ home_team_abbr,
+      penalty_team == visitor_team_abbr &
+        penalty == "OPI" ~ visitor_team_abbr,
+      penalty %in% c("DH", "DPI", "ICT") &
+        penalty_team == home_team_abbr ~ visitor_team_abbr,
+      penalty %in% c("DH", "DPI", "ICT") &
+        penalty_team == visitor_team_abbr ~ home_team_abbr
+    )
+  ) %>%
+  mutate(defteam = ifelse(posteam == home_team_abbr, visitor_team_abbr, home_team_abbr))
+
+
+```
+
+###* Which teams commit the most defensive pass penalties?
+```{r}
+
+penalties_cleaned_df_long %>% 
+  filter(!penalty %in% c("OPI")) %>% 
+  group_by(penalty_team) %>% 
+  summarise(total_penalties = n()) %>% 
+  ungroup() %>% 
+  ggplot(aes(fct_reorder(penalty_team, total_penalties), total_penalties)) +
+  geom_col() + 
+  coord_flip() +
+  labs(x = " ",
+       y = "Total Penalties",
+       title = "KC Outpaced the League in Defensive Pass Penalties in 2018",
+       subtitle = "Penalities Included: Defensive PI, Defensive Holding, Illegal Contact",
+       caption = "Kaggle.com Big Data Bowl 2021") + 
+  theme(plot.title.position = "plot")
+
+```
+
+###* Which teams draw the most defensive pass penalties?
+```{r}
+
+penalties_cleaned_df_long %>% 
+  filter(is.na(posteam))
+
+nfl_fastR_data %>% 
+  filter(old_game_id %in% c("2018090906") & play_id %in% c("1188"))
+
+
+penalties_cleaned_df_long %>% 
+  filter(!penalty %in% c("OPI")) %>% 
+  group_by(posteam) %>% 
+  summarise(total_penalties = n()) %>% 
+  ungroup() %>% 
+  ggplot(aes(fct_reorder(posteam, total_penalties), total_penalties)) +
+  geom_col() + 
+  coord_flip() +
+  labs(x = " ",
+       y = "Total Penalties",
+       title = "Which offenses benefited the most from defensive pass penalties in 2018?",
+       subtitle = "Penalities Included: Defensive PI, Defensive Holding, Illegal Contact",
+       caption = "Kaggle.com Big Data Bowl 2021") + 
+  theme(plot.title.position = "plot")
+
+```
+
+###* Distributions of Penalty Types
+```{r}
+penalties_cleaned_df_long %>%
+  group_by(penalty) %>% 
+  summarise(total = n()) %>% 
+  ungroup() %>% 
+  ggplot(aes(fct_reorder(penalty, total), total)) +
+  geom_col() +
+  coord_flip() +
+  labs(y = "Total Penalties",
+       x = "",
+       title = "Frequency of Pass Penalties in 2018",
+       subtitle = "Penalities Included: Defensive Holding, Defensive PI, Offensive PI, Illegal Contact",
+       caption = "Kaggle.com Big Data Bowl 2021") +
+  theme(plot.title.position = "plot")
+```
+
+# Determine receiver held for defensive holding penalties
+###* Plays involving a defensive holding penalty
+```{r}
+# game_play_ids <- penalties_cleaned_df_wide %>% 
+#   filter(pen_1 %in% c("DH") | pen_2 %in% c("DH") | pen_3 %in% c("DH")) %>% 
+#   unite(game_play, c(game_id, play_id)) %>% 
+#   pull(game_play)
+
+# pull plays that had defensive holding from separation data in database
+# dh_separation_plays <- separation_data %>%
+#   mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+#   filter(game_play %in% c(game_play_ids)) %>%
+#   collect()
+
+# fix play with incorrect event
+# dh_separation_plays_cleaned <- dh_separation_plays %>%
+#   mutate(event = case_when(
+#     game_id %in% c("2018123010") & play_id %in% c(1523) & event %in% c("tackle") ~ "qb_sack",
+#     TRUE ~ event
+#   ))
+
+# write_csv(dh_separation_plays_cleaned, "dh_separation_plays_cleaned.csv")
+
+dh_separation_plays_cleaned <- read_csv("dh_separation_plays_cleaned.csv")
+dh_separation_plays_cleaned <- dh_separation_plays_cleaned %>% 
+  mutate(game_id = game_id %>% as.character())
+
+# nest data
+dh_penalties_nested <- penalties_cleaned_df_long %>%
+  select(game_id, play_id, penalty, penalty_jersey) %>%
+  filter(penalty %in% c("DH")) %>%
+  left_join(
+    select(
+      dh_separation_plays_cleaned,
+      game_id,
+      play_id,
+      frame_id,
+      event,
+      def_jersey_num,
+      nfl_id_def,
+      off_jersey_num,
+      nfl_id_off,
+      distance_from_opponent
+    ),
+    by = c("game_id", "play_id")
+  ) %>%
+  filter(penalty_jersey == def_jersey_num) %>%
+  nest(-c(game_id, play_id, penalty_jersey, nfl_id_def))
+
+
+# the 16 missing penalties are defensive linemen that are not in the separation data set
+penalties_cleaned_df_long %>%
+  filter(penalty %in% c("DH")) %>%
+  select(game_id, play_id, penalty_jersey) %>%
+  left_join(dh_penalties_nested) %>%
+  mutate(penalty_jersey = penalty_jersey %>% as.numeric()) %>%
+  arrange(desc(penalty_jersey))
+```
+
+###* Function to find Closest Offensive Player to Defender Who Committed Penalty
+```{r}
+
+closest_offensive_player_func <- function(df) {
+  
+  # this function find the offensive player that was closest to the defender for duration of play
+  
+  # find frame where ball is snapped
+  ball_snap_frame <- df %>%
+    select(frame_id, event) %>%
+    filter(event %in% c("ball_snap")) %>%
+    distinct() %>%
+    pull(frame_id)
+  
+  # find frame where pass thrown/sack....
+  end_frame <- df %>%
+    select(frame_id, event) %>%
+    filter(
+      event %in% c(
+        "pass_forward",
+        "run",
+        "safety",
+        "qb_strip_sack",
+        "pass_tipped",
+        "qb_sack"
+      )
+    ) %>%
+    distinct() %>%
+    pull(frame_id)
+  
+  # find offensive player(s) penalty defender was closest to from ball snap to pass thrown
+  offensive_players <- 
+    df %>%
+    filter(frame_id %in% c(ball_snap_frame:end_frame)) %>%
+    # filter out football
+    filter(!is.na(off_jersey_num)) %>% 
+    select(frame_id,
+           event,
+           def_jersey_num,
+           off_jersey_num,
+           distance_from_opponent) %>%
+    group_by(frame_id) %>%
+    mutate(min_distance = min(distance_from_opponent)) %>%
+    ungroup() %>%
+    filter(distance_from_opponent == min_distance) %>%
+    count(closest_off_jersey_num = off_jersey_num)
+  
+  # offensive players could result in multiple players, calculate minimum distance of each
+  offensive_players_distance_df <- df %>%
+    group_by(off_jersey_num, nfl_id_off) %>%
+    summarise(
+      min_distance_from_opp = distance_from_opponent %>% min(),
+    ) %>% 
+    ungroup()
+  
+  # join data, find player that had minimum distance of closest offensive players if multiple
+  # possible that we may be grabbing wrong offensive player, may revisit
+  offensive_players_df <- offensive_players %>% 
+    left_join(offensive_players_distance_df, by = c("closest_off_jersey_num" = "off_jersey_num")) %>% 
+    filter(min_distance_from_opp == min(min_distance_from_opp))
+    
+  return(offensive_players_df)
+}
+
+# Test Function
+df <- dh_penalties_nested %>% 
+  filter(game_id %in% c("2018090909") & play_id %in% c(2319)) %>% 
+  select(data) %>% 
+  unnest(data) 
+
+closest_offensive_player_func(df)
+
+
+```
+
+###* Run Function on all defensive holding plays
+```{r}
+
+# finding closest offensive players to penalty offender
+closest_offensive_players_tbl <- dh_penalties_nested %>%
+  mutate(nearest_off_players = map(
+    data,
+    purrr::possibly(closest_offensive_player_func, otherwise = NA)
+  ))
+
+# check one offensive player per play
+closest_offensive_players_tbl %>% 
+  unnest(nearest_off_players) %>% 
+  group_by(game_id, play_id, penalty_jersey) %>% 
+  count() %>% 
+  arrange(desc(n))
+
+
+# write_rds(closest_offensive_players_tbl, "closest_offensive_players_tbl.rds")
+
+closest_offensive_players_tbl <- read_rds("closest_offensive_players_tbl.rds")
+```
+
+###* Which Receivers drew the most defensive holding penalties?
+```{r}
+closest_offensive_players_tbl %>% 
+  unnest(nearest_off_players) %>% 
+  select(game_id, play_id, closest_off_jersey_num, nfl_id_off) %>% 
+  left_join(select(players_df, nfl_id, display_name, position), by = c("nfl_id_off" = "nfl_id")) %>% 
+  group_by(nfl_id_off, display_name) %>% 
+  summarise(total_def_holdings_drawn = n()) %>% 
+  arrange(desc(total_def_holdings_drawn)) %>% 
+  ungroup() %>% 
+  mutate(row = row_number(),
+         rank = min_rank(-total_def_holdings_drawn)) %>% 
+  filter(rank <= 10) %>% 
+  ggplot(aes(fct_reorder(display_name, total_def_holdings_drawn), total_def_holdings_drawn)) +
+  geom_col() +
+  coord_flip() + 
+  labs(x = "",
+       title = "Which Receivers Drew the Most Defensive Holding Penalties?")
+  
+
+
+```
+
+# Which Defenders Committed the Most Defensive Holding Penalties?
+```{r}
+closest_offensive_players_tbl %>% 
+  select(nfl_id_def) %>% 
+  count(nfl_id_def) %>% 
+  left_join(select(players_df, display_name, nfl_id), by = c("nfl_id_def" = "nfl_id")) %>%
+  arrange(desc(n))
+
+```
+
+
+# Time Series Analysis
+```{r}
+separtaion_penalty_joined_df <- closest_offensive_players_tbl %>% 
+  unnest(nearest_off_players) %>%
+  select(-c(data, min_distance_from_opp, n), penalty_nfl_id = nfl_id_def) %>% 
+  left_join(select(dh_separation_plays_cleaned,
+                   -c(penalty_codes, penalty_jersey_numbers, pass_result, offense_play_result,
+                      play_result, epa, is_defensive_pi,)), by = c("game_id", "play_id", "nfl_id_off"))
+  
+
+
+filter_frame_func <- function(df){
+  
+    ball_snap_frame <- df %>%
+    select(frame_id, event) %>%
+    filter(event %in% c("ball_snap")) %>%
+    distinct() %>%
+    pull(frame_id)
+  
+  # find frame where pass thrown/sack....
+  end_frame <- df %>%
+    select(frame_id, event) %>%
+    filter(
+      event %in% c(
+        "pass_forward",
+        "run",
+        "safety",
+        "qb_strip_sack",
+        "pass_tipped",
+        "qb_sack"
+      )
+    ) %>%
+    distinct() %>%
+    pull(frame_id)
+  
+  # find offensive player(s) penalty defender was closest to from ball snap to pass thrown
+  play_filtered <- 
+    df %>%
+    filter(frame_id %in% c(ball_snap_frame:end_frame))
+  
+  return(play_filtered)
+}
+
+
+
+
+dh_time_filtered_df <- separtaion_penalty_joined_df %>%
+  filter(penalty_nfl_id == nfl_id_def) %>%
+  select(
+    game_id,
+    play_id,
+    nfl_id_off,
+    off_player_name,
+    time,
+    frame_id,
+    event,
+    x_off:distance_from_opponent,
+    -route
+  ) %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>%
+  mutate(frames_filtered = map(data, filter_frame_func)) %>%
+  select(-data) %>%
+  unnest(frames_filtered) %>%
+  arrange(game_id, play_id, nfl_id_off, frame_id)
+
+
+dh_time_filtered_df %>% 
+  group_by(game_id, play_id, nfl_id_off) %>% 
+  mutate(seconds_from_snap = frame_id %>% hms::as_hms()) %>% 
+  mutate(seconds_from_snap = row_number()/10 ) %>%
+  mutate(seconds_from_snap = seconds_from_snap %>% hms::as_hms()) %>%
+  mutate(seconds_from_snap = seconds_from_snap %>% as_datetime() ) %>%
+  mutate(seconds_from_snap = seconds_from_snap %>% strptime(format = "%H:%M:%S")) %>%
+  summarise_by_time(
+    .date_var = seconds_from_snap,
+    .by = "10 second",
+    avg_dis = mean(s_off)
+  )
+
+dh_time_filtered_df %>% 
+  group_by(game_id, play_id, nfl_id_off) %>%
+  summarise_by_time(
+    .date_var = frame_id,
+    .by = "10",
+    across(.cols = s_off:distance_from_opponent, .fns = mean)
+  )
+
+dh_time_filtered_df %>% 
+  group_by(game_id, play_id, nfl_id_off) %>% 
+  tk_summary_diagnostics(.date_var = time)
+
+
+
+# Visulization
+dh_time_filtered_df %>% 
+  filter(game_id %in% c("2018090600") & play_id %in% c(1715)) %>% 
+  select(frame_id, s_off, a_off, dis_off, distance_from_opponent) %>% 
+  pivot_longer(-frame_id) %>% 
+  plot_time_series(frame_id, value, .color_var = name, .smooth = FALSE)
+
+dh_time_filtered_df %>% 
+  filter(game_id %in% c("2018090600") & play_id %in% c(1715)) %>% 
+  mutate(seconds_from_snap = row_number()/10) %>% 
+  select(seconds_from_snap, s_off, a_off, dis_off, distance_from_opponent) %>% 
+  pivot_longer(-seconds_from_snap) %>%
+  group_by(name) %>% 
+  plot_time_series(
+    .date_var = seconds_from_snap, 
+    .value    = log1p(value), 
+    .smooth   = TRUE
+    )
+
+
+tk_make_timeseries(.1, 4.5, by = "sec")
+```
+
+# Seconds from snap, Change in speed/acceleration/distance
+```{r}
+dh_time_filtered_df %>% 
+  group_by(game_id, play_id, nfl_id_off) %>% 
+  mutate(seconds_from_snap = row_number()/10,
+         change_in_speed = s_off - lag(s_off, default = 0),
+         change_in_acceleration = a_off - lag(a_off, default = 0),
+         change_in_distance = dis_off - lag(dis_off, default = 0)) %>% 
+  summarise(across(starts_with("change_in"), 
+                   .fns = min,
+                   .names = "min_{col}"),
+            play_length = max(seconds_from_snap))
+```
+
+```{r}
+
+dh_separation_plays_cleaned %>% 
+  glimpse()
+
+# game_play_ids <- dh_separation_plays_cleaned %>% 
+#   distinct(game_play) %>% 
+#   pull(game_play)
+# 
+# game_ids <- games_data %>% 
+#   select(game_id) %>% 
+#   distinct() %>% 
+#   pull()
+# 
+# set.seed(33)
+# sample_game_ids <- sample(game_ids, 25)
+# 
+# # pull plays that did not defensive holding from separation data in database
+# non_dh_plays_df <- separation_data %>%
+#   mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+#   filter(!game_play %in% c(game_play_ids)) %>% 
+#   filter(game_id %in% c(sample_game_ids)) %>% 
+#   collect()
+
+write_csv(non_dh_plays_df, "non_dh_plays_df.csv")
+
+# need to filter out QBs and football
+non_dh_plays_df %>% 
+  filter(game_id %in% c("2018100707") & play_id %in% c(125)) %>% 
+  group_by(game_play, frame_id, nfl_id_off) %>% 
+  filter(distance_from_opponent == min(distance_from_opponent) &
+           off_pos)
+  
+```
+
+
+
+
+
+
+
+
+
+
