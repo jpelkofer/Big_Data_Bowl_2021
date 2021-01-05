@@ -1517,7 +1517,7 @@ secondary_evaluation_tbl <-
   arrange(desc(dh_predicted_over_expected))
 
 # players getting away with defensive holding calls
-top_dhpoe <- secondary_evaluation_tbl %>%
+top_dhoe <- secondary_evaluation_tbl %>%
   top_n(percent_predicted, n = 20) %>%
   ggplot(aes(
     fct_reorder(def_player, percent_predicted),
@@ -1557,7 +1557,7 @@ top_dhpoe <- secondary_evaluation_tbl %>%
     x = "",
     y = "",
     title = "'Hey Ref, He's Holding!'",
-    subtitle = "Top 20 in DHPOE (Minimum 200 Routes Defended)"
+    subtitle = "Top 20 in DHOE (Minimum 200 Routes Defended)"
   ) +
   coord_flip() +
   theme(
@@ -1571,7 +1571,7 @@ top_dhpoe <- secondary_evaluation_tbl %>%
   )
 
 # players avoiding defensive holding calls
-bottom_dhpoe <- secondary_evaluation_tbl %>%
+bottom_dhoe <- secondary_evaluation_tbl %>%
   top_n(-percent_predicted, n = 20) %>%
   ggplot(aes(
     fct_reorder(def_player, -percent_predicted),
@@ -1592,7 +1592,7 @@ bottom_dhpoe <- secondary_evaluation_tbl %>%
     x = "",
     y = "",
     title = "Players Unlikely to Be Holding",
-    subtitle = "Bottom 20 in DHPOE, (Minimum 200 Routes Defended)"
+    subtitle = "Bottom 20 in DHOE, (Minimum 200 Routes Defended)"
   ) +
   geom_text(
     data = data.frame(x = 12.0579666924506,
@@ -1624,7 +1624,7 @@ bottom_dhpoe <- secondary_evaluation_tbl %>%
   )
 
 # Findings Viz
-top_dhpoe + bottom_dhpoe
+top_dhoe + bottom_dhoe
 ```
 
 ###* Analyzing Routes
