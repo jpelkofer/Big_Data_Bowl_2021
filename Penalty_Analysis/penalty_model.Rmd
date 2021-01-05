@@ -1,0 +1,1804 @@
+---
+title: "penalty_model"
+author: "Jarrod Pelkofer"
+date: "12/12/2020"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Load Libraries, Set Theme, Source Scripts, Connect to DB
+```{r}
+# Core Package
+library(tidyverse, warn.conflicts = FALSE)
+options(dplyr.summarise.inform = FALSE)
+library(lubridate)
+
+# Modeling Package
+library(tidymodels)
+
+# Database
+library(DBI)
+library(RPostgres)
+
+# Visualization Package
+library(DataExplorer)
+library(vip)
+library(patchwork)
+library(ggtext)
+library(extrafont)
+library(gt)
+
+font_import()
+loadfonts(device = "win")
+
+# Set Theme
+theme_set(theme_minimal())
+
+source("scripts/defensive_holding_analysis_functions.R")
+
+#connect to db
+con <- dbConnect(drv = RPostgres::Postgres(), 
+                 user = "postgres", 
+                 password = keyring::key_get("postgres_db", "postgres"), 
+                 dbname = "big_data_bowl_db")
+
+# DB table connections
+separation_data <- tbl(con, "separation_data_tbl")
+tracking_tbl <- tbl(con, "tracking_tbl")
+pbp_data <- tbl(con, "plays_tbl")
+fastR_data <- tbl(con, "nflfastR_tbl")
+games_data <- tbl(con, "games_tbl")
+players_tbl <- tbl(con, "players_tbl")
+```
+
+# Pull Data from database
+```{r}
+
+# pulls all plays involving penalties from pbp data
+penalty_plays <- 
+  pbp_data %>% 
+  select(game_id, play_id, penalty_codes, penalty_jersey_numbers) %>% 
+  filter(!is.na(penalty_codes)) %>% 
+  collect()
+
+games_tbl <- 
+  games_data %>% 
+  collect()
+
+player_data <- 
+  players_tbl %>% 
+  collect()
+
+# data from nflfastR package, used for Introduction
+fastR_tbl <- 
+  fastR_data %>% 
+  collect()
+
+```
+
+# Introduction Code
+```{r}
+# drives with defenisve holding
+dh_drives <- fastR_tbl %>% 
+  select(game_id, drive, penalty_type, posteam_score, posteam_score_post) %>% 
+  filter(penalty_type %in% c("Defensive Holding")) %>% 
+  unite("game_drive", game_id, drive) %>% 
+  pull(game_drive)
+
+# defensive holding drives
+dh_tbl <- fastR_tbl %>% 
+  select(game_id, drive, posteam_score, posteam_score_post) %>%
+  replace_na(list(posteam_score = 0, posteam_score_post = 0)) %>%
+  drop_na(drive) %>% 
+  unite("game_drive", game_id, drive, remove = FALSE) %>%
+  filter(game_drive %in% dh_drives) %>% 
+  mutate(pts_scored = posteam_score_post - posteam_score) %>% 
+  group_by(game_id, drive) %>% 
+  summarise(pts_on_drive = sum(pts_scored)) %>% 
+  ungroup() %>% 
+  summarise(`Points Per Drive` = mean(pts_on_drive) %>% round(1)) %>% 
+  ungroup() %>% 
+  mutate(`Defensive Holding` = "Yes")
+
+# non defensive holding drives
+non_dh_tbl <- fastR_tbl %>% 
+  select(game_id, drive, posteam_score, posteam_score_post) %>%
+  replace_na(list(posteam_score = 0, posteam_score_post = 0)) %>%
+  drop_na(drive) %>% 
+  unite("game_drive", game_id, drive, remove = FALSE) %>%
+  filter(!game_drive %in% dh_drives) %>% 
+  mutate(pts_scored = posteam_score_post - posteam_score) %>% 
+  group_by(game_id, drive) %>% 
+  summarise(pts_on_drive = sum(pts_scored)) %>% 
+  ungroup() %>% 
+  summarise(`Points Per Drive` = mean(pts_on_drive) %>% round(1)) %>% 
+  ungroup() %>% 
+  mutate(`Defensive Holding` = "No")
+
+combined_tbl <- dh_tbl %>% 
+  bind_rows(non_dh_tbl)
+
+combined_tbl %>% 
+  ggplot(aes(`Points Per Drive`, `Defensive Holding`)) +
+  geom_col(aes(fill = `Defensive Holding`), show.legend = FALSE) + 
+  scale_fill_manual(values = c("#013369", "#D50A0A")) +
+  labs(
+    y = " ",
+    title = "Defensive Holding Calls are Valuable!",
+    subtitle = "<b style='color:#D50A0A'>Drives with a Defensive Holding Call </b>vs.<b style='color:#013369'> Drives with No Defensive Holding Call</b>",
+    caption = "Data Source: nflfastR") +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "#013369"),
+    plot.title.position = "plot",
+    plot.subtitle = element_markdown(color = "#013369"),
+    axis.title = element_text(colour = "#013369"),
+    panel.border = element_blank()
+  )
+```
+
+
+# Data Organization/Prep/Wrangling/Feature Creation
+###* Cleaning Penalites pbp Data
+```{r}
+# penalty codes of interest
+pen_codes <- c("ICT", "DH", "DPI", "OPI")
+
+# wide data frame of penalty plays
+penalties_cleaned_df_wide <- 
+  penalty_plays %>% 
+  separate(penalty_codes, into = c("pen_1", "pen_2", "pen_3"), sep = ";") %>% 
+  separate(penalty_jersey_numbers, into = c("pen_1_jersey", "pen_2_jersey", "pen_3_jersey"), sep = ";") %>% 
+  separate(pen_1_jersey, into = c("pen_1_team", "pen_1_jersey"), sep = " ") %>% 
+  separate(pen_2_jersey, into = c("pen_2_team", "pen_2_jersey"), sep = " ") %>%
+  separate(pen_3_jersey, into = c("pen_3_team", "pen_3_jersey"), sep = " ")
+
+# long data frame of penalty plays
+penalties_cleaned_df_long <-
+  penalties_cleaned_df_wide %>%
+  select(
+    game_id,
+    play_id,
+    penalty = pen_1,
+    penalty_team = pen_1_team,
+    penalty_jersey = pen_1_jersey
+  ) %>%
+  bind_rows(
+    select(
+      penalties_cleaned_df_wide,
+      game_id,
+      play_id,
+      penalty = pen_2,
+      penalty_team = pen_2_team,
+      penalty_jersey = pen_2_jersey
+    )
+  ) %>%
+  bind_rows(
+    select(
+      penalties_cleaned_df_wide,
+      game_id,
+      play_id,
+      penalty = pen_3,
+      penalty_team = pen_3_team,
+      penalty_jersey = pen_3_jersey
+    )
+  ) %>%
+  drop_na() %>%
+  filter(penalty %in% c(pen_codes)) %>%
+  left_join(games_tbl) %>%
+  mutate(
+    posteam = case_when(
+      penalty_team == home_team_abbr & penalty == "OPI" ~ home_team_abbr,
+      penalty_team == visitor_team_abbr &
+        penalty == "OPI" ~ visitor_team_abbr,
+      penalty %in% c("DH", "DPI", "ICT") &
+        penalty_team == home_team_abbr ~ visitor_team_abbr,
+      penalty %in% c("DH", "DPI", "ICT") &
+        penalty_team == visitor_team_abbr ~ home_team_abbr
+    )
+  ) %>%
+  mutate(defteam = ifelse(posteam == home_team_abbr, visitor_team_abbr, home_team_abbr))
+
+```
+
+###* Pulling and Wrangle Separation Data for Plays Involing Defensive Holding
+```{r}
+# game/play ids for plays involving defensive holding
+game_play_ids <- 
+  penalties_cleaned_df_wide %>%
+  filter(pen_1 %in% c("DH") | pen_2 %in% c("DH") | pen_3 %in% c("DH")) %>%
+  unite(game_play, c(game_id, play_id)) %>%
+  pull(game_play)
+
+# pull plays that had defensive holding from separation data in database
+dh_separation_plays <- 
+  separation_data %>%
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(game_play %in% c(game_play_ids)) %>%
+  collect()
+
+# fix play with incorrect event
+dh_separation_plays_cleaned <- 
+  dh_separation_plays %>%
+  mutate(event = case_when(
+    game_id %in% c("2018123010") & play_id %in% c(1523) & event %in% c("tackle") ~ "qb_sack",
+    TRUE ~ event
+  )) %>% 
+  mutate(game_id = game_id %>% as.character())
+
+# nest data by gameid, playid, penalty, and player who committed penalty
+dh_penalties_nested <- penalties_cleaned_df_long %>%
+  select(game_id, play_id, penalty, penalty_jersey) %>%
+  filter(penalty %in% c("DH")) %>%
+  left_join(
+    select(
+      dh_separation_plays_cleaned,
+      game_id,
+      play_id,
+      frame_id,
+      event,
+      def_jersey_num,
+      nfl_id_def,
+      off_jersey_num,
+      nfl_id_off,
+      distance_from_opponent
+    ),
+    by = c("game_id", "play_id")
+  ) %>%
+  filter(penalty_jersey == def_jersey_num) %>%
+  nest(-c(game_id, play_id, penalty_jersey, nfl_id_def))
+
+# Note: there were 274 DH plays, the 16 missing penalties are defensive linemen that are not included in tracking data
+penalties_cleaned_df_long %>%
+  filter(penalty %in% c("DH")) %>%
+  select(game_id, play_id, penalty_jersey) %>%
+  left_join(dh_penalties_nested) %>%
+  mutate(penalty_jersey = penalty_jersey %>% as.numeric()) %>%
+  arrange(desc(penalty_jersey))
+```
+
+###* Run Function to Find Closest Offensive Player Who Committed Penalty
+```{r}
+# finding closest offensive players to penalty offender
+closest_offensive_players_tbl <- 
+  dh_penalties_nested %>%
+  mutate(nearest_off_players = map(
+    data,
+    purrr::possibly(closest_offensive_player_func, otherwise = NA)
+  ))
+
+# check one offensive player per play
+closest_offensive_players_tbl %>% 
+  unnest(nearest_off_players) %>% 
+  group_by(game_id, play_id, penalty_jersey) %>% 
+  count() %>% 
+  arrange(desc(n))
+```
+
+###* Grab Random Sampling of Separation data for plays that did not involve defensive holding
+```{r}
+game_ids <- games_tbl %>%
+  select(game_id) %>%
+  distinct() %>%
+  pull()
+
+set.seed(33)
+sample_game_ids <- sample(game_ids, 25)
+
+# pull plays that did not involve defensive holding from separation data in database
+non_dh_plays_df <- separation_data %>%
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(game_play_ids)) %>%
+  filter(game_id %in% c(sample_game_ids)) %>%
+  collect()
+```
+
+###* Combine Defensive Holding and Non-Defensive Holding Plays
+```{r}
+
+# data frame for defensive holding plays, add dh column
+dh_plays <- 
+  closest_offensive_players_tbl %>%
+  unnest(nearest_off_players) %>%
+  select(game_id, play_id, nfl_id_off) %>%
+  left_join(select(dh_separation_plays_cleaned, everything()), by = c("game_id", "play_id", "nfl_id_off")) %>%
+  mutate(dh = 1)
+
+
+# data frame for plays where dh was not called, add dh column
+non_dh_plays <- non_dh_plays_df %>% 
+  mutate(dh = 0)
+
+# combine data sets
+plays_df <- bind_rows(dh_plays, non_dh_plays_df)
+
+# filter out observations for the football and QB's, not relevant for our analysis
+plays_filtered_df <- plays_df %>% 
+  filter(!off_pos %in% c(NA, "QB"))
+```
+
+
+###* Filter for events between ball_snap and pass_thrown/sack/etc
+```{r}
+
+# run filter frame function
+plays_frame_filtered_df <- 
+  plays_filtered_df %>% 
+  group_by(game_id, play_id, frame_id, nfl_id_off) %>% 
+  filter(distance_from_opponent == min(distance_from_opponent)) %>% 
+  ungroup() %>% 
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(filtered_data = map(data, purrr::possibly(filter_frame_func, otherwise = NA)))
+
+# unnest
+plays_frame_filtered_unnested <- 
+  plays_frame_filtered_df %>% 
+  # some plays blew up during filter frame function, those will be removed
+  drop_na() %>% 
+  select(-data) %>% 
+  unnest(filtered_data)
+
+# fix dh column
+plays_frame_fixed <- 
+  plays_frame_filtered_unnested %>% 
+  mutate(dh = ifelse(is.na(dh), 0, 1))
+
+# check missing values
+plays_frame_fixed %>% 
+  plot_missing()
+
+```
+
+###* Create Features for Modeling
+```{r}
+
+# nest plays
+plays_nested <- plays_frame_fixed %>%
+  nest(-c(game_id, play_id, nfl_id_off))
+
+# run features function
+plays_added_features_nested <- plays_nested %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+# join with players data and add some additional features
+feature_data <- 
+  plays_added_features_nested %>%
+  select(-data) %>%
+  drop_na() %>% 
+  unnest(features) %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+```
+
+# Data Split for Modeling
+```{r}
+
+set.seed(33)
+data_split <- initial_split(feature_data, strata = dh)
+train_data <- training(data_split)
+test_data <- testing(data_split)
+
+```
+
+# Data Exploration on Training Data
+```{r}
+# distributions of variables
+train_data %>% 
+  plot_histogram()
+
+# box plots of features that largely drive the model
+train_data %>% 
+  select(percentage_frames_within_1.25_yards, 
+         min_distance_from_opp,
+         play_length,
+         min_change_in_distance_times_speed_10,
+         max_consecutive_frames,
+         min_speed_difference,
+         dh) %>% 
+  pivot_longer(-dh, names_to = "stat") %>% 
+  ggplot(aes(stat, value)) +
+  geom_boxplot(aes(color = dh), show.legend = FALSE) +
+  scale_color_manual(values = c("#013369", "#D50A0A")) +
+  facet_wrap(~ stat, scales = "free", ) +
+  labs(
+    x = "",
+    y = "",
+    title = "<b style='color:#013369'>No Defensive Holding Call </b>vs.<b style='color:#D50A0A'> Defensive Holding Call</b>",
+    subtitle = ""
+  ) +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.major.x = element_blank(),
+    plot.title = element_markdown(face = "bold"),
+    plot.title.position = "plot",
+    strip.text.x = element_blank(),
+    panel.border = element_blank()
+  )
+
+# down looks significant, particularly fourth down
+train_data %>%
+  select(down, dh) %>% 
+  group_by(down) %>% 
+  count(dh) %>% 
+  ungroup() %>% 
+  pivot_wider(names_from = dh, values_from = n) %>% 
+  rename(no_dh = `0`, dh = `1`) %>% 
+  mutate(percent_dh = dh/(dh+no_dh)) %>% 
+  ggplot(aes(down, percent_dh)) +
+  geom_col() + 
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Down",
+       y = "",
+       title = "Defensive Holding Calls Increase by Down")
+
+# man vs. zone looks significant
+train_data %>% 
+  select(dh, man_coverage) %>% 
+  group_by(man_coverage) %>% 
+  count(dh) %>%
+  ungroup() %>% 
+  pivot_wider(names_from = dh, values_from = n) %>% 
+  rename(no_dh = `0`, dh = `1`) %>% 
+  mutate(percent_dh = dh/(dh+no_dh)) %>% 
+  ggplot(aes(man_coverage, percent_dh)) +
+  geom_col() + 
+  scale_x_discrete(labels = c("Zone", "Man")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Man Coverage",
+       y = "",
+       title = "Defensive Holding Penalites More Likely During Man Coverage")
+
+# press coverage
+train_data %>% 
+  select(dh, press_coverage) %>% 
+  group_by(press_coverage) %>% 
+  count(dh) %>%
+  ungroup() %>% 
+  pivot_wider(names_from = dh, values_from = n) %>% 
+  rename(no_dh = `0`, dh = `1`) %>% 
+  mutate(percent_dh = dh/(dh+no_dh)) %>% 
+  ggplot(aes(press_coverage, percent_dh)) +
+  geom_col() + 
+  scale_x_discrete(labels = c("Press Coverage", "No Press Coverage")) +
+  scale_y_continuous(labels = scales::percent) +
+  labs(x = "Press Coverage",
+       y = "",
+       title = "Defensive Holding Penalites More Likely when NO Press Coverage")
+
+train_data %>% 
+  select(-contains("id")) %>% 
+  plot_correlation()
+
+train_data %>% 
+  plot_missing()
+
+```
+
+# Modeling
+###* Logistic Regression Model Spec
+```{r}
+
+# logistic reg model spec
+lr_mod <- 
+  logistic_reg() %>% 
+  set_engine("glm")
+
+```
+
+###* Create Folds of Training Data for Cross Validation
+```{r}
+# CV data
+train_folds <- vfold_cv(train_data, v = 10, strata = dh)
+
+```
+
+###* Data Pre-Processing for Logistic Regression Model
+```{r}
+
+# log_regression recipe
+lr_rec <-
+  recipe(
+    dh ~ .,
+    data = train_data
+  ) %>%
+  # transform numeric predictor variables to better suit for logistic regression modeling
+  step_BoxCox(all_numeric(), -nfl_id_off, -nfl_id_def, -game_id, -play_id) %>% 
+  step_center(all_numeric(), -nfl_id_off, -nfl_id_def, -game_id, -play_id) %>%
+  step_scale(all_numeric(), -nfl_id_off, -nfl_id_def, -game_id, -play_id) %>%
+  
+  # create dummy variables for factor variables
+  step_dummy(all_nominal(), -all_outcomes(), -nfl_id_off, -nfl_id_def, -game_id, -play_id, one_hot = TRUE)%>%
+  
+  # remove percentage as closest defender, we know this is highly correlated with man coverage variable
+  step_rm(percentage_as_closest_defender) %>% 
+  
+  # this step will attempt to remove other highly correlated predictors
+  step_corr(all_predictors(), -nfl_id_off, -nfl_id_def, -game_id, -play_id) %>%
+  
+  # update roles for variables that should not be apart of the modeling process
+  update_role(nfl_id_off, nfl_id_def, game_id, play_id, new_role = "ID") %>% 
+  
+  # random oversampling method to account for large disparity between dh and non-dh
+  themis::step_rose(dh)
+
+# check recipe works  
+lr_rec %>% prep() %>% bake(train_data)
+
+```  
+
+###* Create Modeling Workflow
+```{r}
+
+lr_wf <- 
+  workflow() %>%
+  add_recipe(lr_rec) %>% 
+  add_model(lr_mod)
+
+```
+
+###* Logistic Regression Fit
+```{r}
+#parallel processing
+doParallel::registerDoParallel()
+
+# logistic regression fit to CV folds
+lr_fit <-
+  lr_wf %>%
+  fit_resamples(
+    train_folds,
+    metrics = metric_set(roc_auc, accuracy, sensitivity, specificity, j_index),
+    control = control_resamples(save_pred = TRUE)
+  )
+
+```
+
+###* Evaluate Model Fit
+```{r}
+lr_fit %>% 
+  collect_metrics()
+
+lr_fit %>% 
+  conf_mat_resampled()
+```
+
+###* Final fit, fit on all training data, test on test data
+```{r}
+
+final_lr_wf <- 
+  lr_wf %>% 
+  last_fit(data_split)
+```
+
+###* Evaluate Final Fit
+```{r}
+# accuracy/roc almost identical to training fit, indicating model was not overfit
+final_lr_wf %>% 
+  collect_metrics()
+```
+
+
+```{r}
+# Confusion Matrix for Final Fit
+final_lr_wf %>% 
+  collect_predictions() %>% 
+  bind_cols(select(test_data, min_distance_from_opp)) %>% 
+  conf_mat(dh, .pred_class)
+```
+
+###* Fit Again on all training data to get final model
+```{r}
+final_lr_model <- 
+  lr_wf %>% 
+  fit(train_data)
+
+# Save Modeling Artifacts
+lr_modeling_list <- list(
+  
+  # feature data
+  feature_data = feature_data,
+  
+  #train/test data
+  train_data = train_data,
+  test_dat = test_data,
+  
+  # lr recipe
+  lr_rec = lr_rec,
+  
+  # lr workflow
+  lr_wf = lr_wf,
+  
+  # lr final model
+  final_lr_model = final_lr_model
+  
+)
+
+write_rds(lr_modeling_list, "models/lr_modeling_list.rds")
+```
+
+###* Take a look at the top features driving the model
+```{r}
+# Model Feature Plot, used in "The Model" Section
+final_lr_model %>%
+  pull_workflow_fit() %>%
+  vip(num_features = 8, aesthetics = list(fill = "#013369")) +
+  labs(title = "Features Driving the Model") +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "#013369"),
+    plot.title.position = "plot",
+    plot.subtitle = element_markdown(),
+    axis.title.x = element_text(color = "#013369"),
+    axis.text.y = element_text(color = "#D50A0A"),
+    panel.border = element_blank()
+  )
+```
+
+
+# Pull Separation Data in Chunks and Predict with Model
+```{r}
+#load model
+final_lr_model <- modeling_artifacts$final_lr_model
+
+game_ids <- games_tbl %>% 
+  pull(game_id)
+
+# Grab Data for Analysis
+dh_plays <- closest_offensive_players_tbl %>% 
+  unite(game_play, c(game_id, play_id)) %>% 
+  pull(game_play)
+
+game_ids_subset <- game_ids[1:25]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_1 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[26:50]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_2 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[51:75]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_3 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[76:100]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_4 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[101:125]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_5 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[126:150]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_6 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[151:175]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_7 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[176:200]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_8 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[201:225]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_9 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+
+game_ids_subset <- game_ids[226:253]
+
+evaluation_data <- separation_data %>%
+  filter(game_id %in% c(game_ids_subset)) %>% 
+  mutate(game_play = str_c(game_id, play_id, sep = "_")) %>%
+  filter(!game_play %in% c(dh_plays)) %>%
+  collect()
+
+# Prepare Data for Model Prediction
+
+# use data prep function (which includes filter frame function)
+prepped_data <- evaluation_data %>% 
+  data_prep_function()
+
+# use create features function
+prediction_data_1 <- prepped_data %>%
+  nest(-c(game_id, play_id, nfl_id_off)) %>% 
+  mutate(features = map(data, purrr::possibly(create_features_function, otherwise = NA)))
+
+
+# merge with players data
+prediction_data_2 <- prediction_data_1 %>%
+  select(-data) %>%
+  unnest(features) %>%
+  drop_na() %>%
+  mutate(dh = dh %>% as.factor()) %>%
+  # add offensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      off_height = height,
+      off_weight = weight
+    ),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  # add defensive player weight and height
+  left_join(
+    select(
+      player_data,
+      nfl_id,
+      def_height = height,
+      def_weight = weight
+    ),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  # calculate weight and height adv
+  mutate(off_height_adv = off_height - def_height,
+         off_weight_adv = off_weight - def_weight,
+         down = down %>% as.factor(),
+         man_coverage = man_coverage %>% as.factor())
+
+
+# Model Prediction Data
+model_prediction_tbl_10 <- predict(final_lr_model, prediction_data_2, type = "prob") %>%
+  bind_cols(predict(final_lr_model, prediction_data_2)) %>%
+  bind_cols(prediction_data_2)
+```
+
+# Analysis
+###* Clean Up Predictions Table
+```{r}
+
+# combine Prediction Datasets
+model_prediction_tbl <- 
+  model_prediction_tbl_1 %>% 
+  bind_rows(model_prediction_tbl_2) %>% 
+  bind_rows(model_prediction_tbl_3) %>%
+  bind_rows(model_prediction_tbl_4) %>%
+  bind_rows(model_prediction_tbl_5) %>%
+  bind_rows(model_prediction_tbl_6) %>%
+  bind_rows(model_prediction_tbl_7) %>%
+  bind_rows(model_prediction_tbl_8) %>%
+  bind_rows(model_prediction_tbl_9) %>%
+  bind_rows(model_prediction_tbl_10)
+
+# add player names and positions, group positions, isolate for features used in model
+model_prediction_cleaned_tbl <-
+  model_prediction_tbl %>%
+  left_join(
+    select(player_data, nfl_id, def_player = display_name, def_pos = position),
+    by = c("nfl_id_def" = "nfl_id")
+  ) %>%
+  left_join(
+    select(player_data, nfl_id, off_player = display_name, off_pos = position),
+    by = c("nfl_id_off" = "nfl_id")
+  ) %>%
+  mutate(def_pos = case_when(
+    def_pos == "DB" ~ "CB",
+    def_pos %in% c("SS", "FS") ~ "S",
+    TRUE ~ def_pos
+  )) %>%
+  mutate(def_pos_group = fct_collapse(
+    def_pos,
+    secondary      = c("CB", "S"),
+    linebacker     = c("OLB", "ILB", "LB", "MLB"),
+    defensive_line = c("DE", "NT"),
+    other          = c("WR", "FB")
+  )) %>%
+  mutate(off_pos = case_when(
+    off_pos == "HB" ~ "RB",
+    off_pos %in% c("CB", "DE", "DT", "FS") ~ "Other",
+    TRUE ~ off_pos
+  )) %>% 
+  select(game_id, play_id, nfl_id_off, off_player, off_pos, def_player, def_pos, def_pos_group, everything())
+
+write_csv(model_prediction_cleaned_tbl, "predictions/model_prediction_cleaned_tbl.csv")
+
+model_prediction_cleaned_tbl <- read_csv("predictions/model_prediction_cleaned_tbl.csv")
+```
+
+###* Overall Evaluation
+```{r}
+total_routes_evaluated <- length(model_prediction_cleaned_tbl$game_id)
+
+# Percentage of routes model is predicting defensive holding on
+model_prediction_percentage <- 
+  model_prediction_cleaned_tbl %>% 
+  filter(.pred_class == 1) %>% 
+  count(.pred_class) %>% 
+  mutate(percent_predicted = n/total_routes_evaluated) %>% 
+  pull(percent_predicted)
+
+# Percentage over model average by defender
+overall_evaluation_tbl <-
+  model_prediction_cleaned_tbl %>%
+  count(def_player, nfl_id_def) %>%
+  arrange(desc(n)) %>%
+  left_join(
+    select(
+      model_prediction_cleaned_tbl,
+      def_player,
+      nfl_id_def,
+      def_pos_group,
+      .pred_class
+    ) %>%
+      filter(.pred_class == 1) %>%
+      count(def_player, nfl_id_def),
+    by = c("def_player", "nfl_id_def")
+  ) %>%
+  rename(plays_predicted_dh = n.y,
+         total_plays_defended = n.x) %>%
+  replace_na(list(plays_predicted_dh = 0)) %>%
+  mutate(percent_predicted = plays_predicted_dh / total_plays_defended) %>%
+  mutate(dh_predicted_over_expected = percent_predicted - model_prediction_percentage) %>%
+  filter(total_plays_defended > 100) %>%
+  arrange(desc(dh_predicted_over_expected))
+
+# Top 20 over expected
+overall_evaluation_tbl %>%
+  top_n(percent_predicted, n = 20) %>%
+  ggplot(aes(
+    fct_reorder(def_player, percent_predicted),
+    percent_predicted
+  )) +
+  geom_point(size = 3) +
+  geom_segment(aes(
+    x = def_player,
+    xend = def_player,
+    y = 0,
+    yend = percent_predicted
+  )) +
+  geom_hline(yintercept = model_prediction_percentage,
+             color = "red",
+             linetype = "dashed") +
+ # scale_y_continuous(limits = c(0, .10), labels = scales::percent) +
+  labs(x = "",
+       y = "",
+       title = "Hey Ref, He's Holding!") +
+  coord_flip() +
+  theme(
+    plot.title.position = "plot",
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank()
+  )
+
+# Defensive Holding Leaders chart 
+dh_leaders_chart <- 
+  closest_offensive_players_tbl %>% 
+  select(nfl_id_def) %>% 
+  count(nfl_id_def) %>% 
+  left_join(select(player_data, display_name, nfl_id), by = c("nfl_id_def" = "nfl_id")) %>%
+  arrange(desc(n)) %>% 
+  head(12) %>% 
+  left_join(select(overall_evaluation_tbl, def_player, dh_predicted_over_expected), 
+            by = c("display_name" = "def_player")) %>% 
+  ggplot(aes(fct_reorder(display_name, n), n)) + 
+  geom_col(fill = "#013369") +
+  labs(x     = "",
+       y     = "Defensive Holding Penalties Committed",
+       title = "2018 League Leaders in Defensive Holding Penalties") +
+  coord_flip() +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "#013369"),
+    plot.title.position = "plot",
+    plot.subtitle = element_markdown(color = "#013369"),
+    axis.title = element_text(colour = "#013369")
+  )
+
+# DH leaders model prediction chart
+model_predictions_chart <-
+  closest_offensive_players_tbl %>%
+  select(nfl_id_def) %>%
+  count(nfl_id_def) %>%
+  left_join(select(player_data, display_name, nfl_id),
+            by = c("nfl_id_def" = "nfl_id")) %>%
+  arrange(desc(n)) %>%
+  head(12) %>%
+  left_join(
+    select(
+      overall_evaluation_tbl,
+      def_player,
+      percent_predicted,
+      dh_predicted_over_expected
+    ),
+    by = c("display_name" = "def_player")
+  ) %>%
+  ggplot(aes(fct_reorder(display_name, n), percent_predicted)) +
+  geom_point(size = 3, color = "#013369") +
+  geom_segment(aes(
+    x = display_name,
+    xend = display_name,
+    y = 0,
+    yend = percent_predicted
+  ),
+  color = "#013369") +
+  geom_hline(yintercept = .1937,
+             color = "#D50A0A",
+             linetype = "dashed") +
+  scale_y_continuous(labels = scales::percent) +
+  geom_text(
+    data = data.frame(x = 7.01595719125876,
+                      y = 0.243222012421846,
+                      label = "Model Average"),
+    mapping = aes(x = x,
+                  y = y,
+                  label = label),
+    size = 3.86605783866058,
+    angle = 0L,
+    lineheight = 1L,
+    hjust = 0.5,
+    vjust = 0.5,
+    colour = "#D50A0A",
+    family = "Calibri",
+    fontface = "plain",
+    inherit.aes = FALSE,
+    show.legend = FALSE
+  ) +
+  labs(x = "",
+       y = "",
+       title = "Percentage of Routes Defenisve Holding Predicted") +
+  coord_flip() +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "#013369"),
+    plot.title.position = "plot",
+    plot.subtitle = element_markdown(color = "#013369")
+  )
+
+# DH vs Model Predictions Plot
+dh_leaders_chart + model_predictions_chart
+
+
+
+```
+
+
+###* Evaluating Secondary
+```{r}
+total_routes_evaluated <- nrow(subset(model_prediction_cleaned_tbl, def_pos_group == "secondary"))
+
+model_prediction_percentage <- 
+  model_prediction_cleaned_tbl %>%
+  filter(def_pos_group %in% c("secondary")) %>% 
+  filter(.pred_class == 1) %>% 
+  count(.pred_class) %>% 
+  mutate(percent_predicted = n/total_routes_evaluated) %>% 
+  pull(percent_predicted)
+
+secondary_evaluation_tbl <-
+  model_prediction_cleaned_tbl %>%
+  filter(def_pos_group %in% c("secondary")) %>%
+  count(def_player, nfl_id_def) %>%
+  arrange(desc(n)) %>%
+  left_join(
+    select(
+      model_prediction_cleaned_tbl,
+      def_player,
+      nfl_id_def,
+      def_pos_group,
+      .pred_class
+    ) %>%
+      filter(def_pos_group %in% c("secondary")) %>%
+      filter(.pred_class == 1) %>%
+      count(def_player, nfl_id_def),
+    by = c("def_player", "nfl_id_def")
+  ) %>%
+  rename(plays_predicted_dh = n.y,
+         total_plays_defended = n.x) %>%
+  replace_na(list(plays_predicted_dh = 0)) %>%
+  mutate(percent_predicted = plays_predicted_dh / total_plays_defended) %>%
+  mutate(dh_predicted_over_expected = percent_predicted - model_prediction_percentage) %>%
+  filter(total_plays_defended > 200) %>%
+  arrange(desc(dh_predicted_over_expected))
+
+# players getting away with defensive holding calls
+top_dhpoe <- secondary_evaluation_tbl %>%
+  top_n(percent_predicted, n = 20) %>%
+  ggplot(aes(
+    fct_reorder(def_player, percent_predicted),
+    percent_predicted
+  )) +
+  geom_point(size = 3, color = "#013369") +
+  geom_segment(aes(
+    x = def_player,
+    xend = def_player,
+    y = .193711,
+    yend = percent_predicted
+  ),
+  color = "#013369") +
+  geom_hline(yintercept = model_prediction_percentage,
+             color = "#D50A0A",
+             linetype = "dashed") +
+  scale_y_continuous(limits = c(0, .40), labels = scales::percent) +
+  geom_text(
+    data = data.frame(x = 12.0579666924506,
+                      y = 0.131542257436277,
+                      label = "Model Average"),
+    mapping = aes(x = x,
+                  y = y,
+                  label = label),
+    size = 3.86605783866058,
+    angle = 0L,
+    lineheight = 1L,
+    hjust = 0.5,
+    vjust = 0.5,
+    colour = "#D50A0A",
+    family = "Calibri",
+    fontface = "plain",
+    inherit.aes = FALSE,
+    show.legend = FALSE
+  ) +
+  labs(
+    x = "",
+    y = "",
+    title = "'Hey Ref, He's Holding!'",
+    subtitle = "Top 20 in DHPOE (Minimum 200 Routes Defended)"
+  ) +
+  coord_flip() +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "#013369"),
+    plot.title.position = "plot",
+    plot.subtitle = element_markdown(color = "#013369")
+  )
+
+# players avoiding defensive holding calls
+bottom_dhpoe <- secondary_evaluation_tbl %>%
+  top_n(-percent_predicted, n = 20) %>%
+  ggplot(aes(
+    fct_reorder(def_player, -percent_predicted),
+    percent_predicted
+  )) +
+  geom_point(size = 3, color = "#013369") +
+  geom_segment(aes(
+    x = def_player,
+    xend = def_player,
+    y = .194,
+    yend = percent_predicted
+  ), color = "#013369") +
+  geom_hline(yintercept = .194,
+             color = "#D50A0A",
+             linetype = "dashed") +
+  scale_y_continuous(limits = c(0, .40), labels = scales::percent) +
+  labs(
+    x = "",
+    y = "",
+    title = "Players Unlikely to Be Holding",
+    subtitle = "Bottom 20 in DHPOE, (Minimum 200 Routes Defended)"
+  ) +
+  geom_text(
+    data = data.frame(x = 12.0579666924506,
+                      y = 0.258663026411452,
+                      label = "Model Average"),
+    mapping = aes(x = x,
+                  y = y,
+                  label = label),
+    size = 3.86605783866058,
+    angle = 0L,
+    lineheight = 1L,
+    hjust = 0.5,
+    vjust = 0.5,
+    colour = "#D50A0A",
+    family = "Calibri",
+    fontface = "plain",
+    inherit.aes = FALSE,
+    show.legend = FALSE
+  ) +
+  coord_flip() +
+  theme(
+    text = element_text(size = 14, family = "Calibri"),
+    plot.background = element_rect(fill = "#D8D8D8"),
+    panel.grid.minor = element_blank(),
+    panel.grid.major.y = element_blank(),
+    plot.title = element_text(face = "bold", color = "#013369"),
+    plot.title.position = "plot",
+    plot.subtitle = element_markdown(color = "#013369")
+  )
+
+# Findings Viz
+top_dhpoe + bottom_dhpoe
+```
+
+###* Analyzing Routes
+```{r}
+
+routes_tbl <- 
+  tracking_tbl %>%
+  select(game_id, play_id, nfl_id, route) %>%
+  filter(!is.na(route)) %>%
+  distinct() %>%
+  collect()
+
+routes_tbl <- 
+  routes_tbl %>%
+  mutate(game_id = game_id %>% as.character())
+
+# total dh predicted
+total_dh_predicted <- model_prediction_cleaned_tbl %>%
+  filter(def_pos_group == "secondary") %>%
+  left_join(routes_tbl, by = c("game_id",
+                               "play_id",
+                               "nfl_id_off" = "nfl_id")) %>%
+  mutate(route = ifelse(is.na(route), "undefined", route)) %>%
+  filter(.pred_class == 1) %>%
+  count() %>% 
+  pull(n)
+
+# total dh predicted per route
+total_dh_predicted_per_route <- 
+  model_prediction_cleaned_tbl %>%
+  filter(def_pos_group == "secondary") %>%
+  left_join(routes_tbl, by = c("game_id",
+                               "play_id",
+                               "nfl_id_off" = "nfl_id")) %>%
+  mutate(route = ifelse(is.na(route), "undefined", route)) %>%
+  filter(.pred_class == 1) %>%
+  count(route) %>% 
+  mutate(total_dh = total_dh_predicted) %>% 
+  mutate(dh_route_percentage = n/total_dh) %>% 
+  arrange(desc(dh_route_percentage))
+
+
+percent_predicted_by_route <- function(player){
+  # function to get percentage of defensive holding calls per route as predicted by model
+  
+  total_count <-
+    model_prediction_cleaned_tbl %>%
+    filter(def_pos_group == "secondary") %>%
+    left_join(routes_tbl, by = c("game_id",
+                                 "play_id",
+                                 "nfl_id_off" = "nfl_id")) %>%
+    mutate(route = ifelse(is.na(route), "undefined", route)) %>%
+    filter(.pred_class == 1) %>%
+    filter(def_player == player) %>%
+    count() %>%
+    pull(n)
+  
+  route_count <-
+    model_prediction_cleaned_tbl %>%
+    filter(def_pos_group == "secondary") %>%
+    left_join(routes_tbl, by = c("game_id",
+                                 "play_id",
+                                 "nfl_id_off" = "nfl_id")) %>%
+    mutate(route = ifelse(is.na(route), "undefined", route)) %>%
+    filter(.pred_class == 1) %>%
+    filter(def_player == player) %>%
+    count(route) %>%
+    mutate(total_dh = total_count) %>%
+    mutate(player_route_percentage = n / total_dh) %>%
+    mutate(Defender = player) %>% 
+    arrange(desc(player_route_percentage))
+  
+  return(route_count)
+}
+
+# Analyzing Stephon Gilmore
+Gilmore_dh_routes <- percent_predicted_by_route("Stephon Gilmore")
+
+gilmore_joined <- Gilmore_dh_routes %>% 
+  left_join(select(total_dh_predicted_per_route, route, dh_route_percentage), by = c("route")) %>% 
+  select(Defender, route, Gilmore = player_route_percentage, `Model Average` = dh_route_percentage) %>% 
+  mutate(Diff = Gilmore - `Model Average`)
+
+# Table Used in putting model to use
+gilmore_joined %>%
+  select(-Defender) %>%
+  gt() %>%
+  tab_header(title    = "Load Up on Go and Slant Routes vs. Stephon Gilmore",
+             subtitle = "Defensive Holding Calls Predicted By Route") %>%
+  opt_all_caps() %>%
+  tab_style(style = list(cell_text(
+    color = "#013369",
+    align = "left",
+    weight = "bold"
+  )),
+  locations = list(cells_title(groups = "title"))) %>%
+  fmt_percent(columns = 2:4,
+              decimals = 2) %>%
+  tab_style(style = list(cell_text(color = "#D50A0A")),
+            locations = cells_body(columns = vars(Diff),
+                                   rows = Diff < 0)) %>%
+  tab_style(style = list(cell_text(color = "#013369",
+                                   weight = "bold")),
+            locations = cells_body(columns = 1:4,
+                                   rows = Diff > 0))
+  
+```
+
+
+
+
+# Random Forest Modeling that did not forecast as well as logistic regression modeling
+```{r}
+
+# RF Recipe
+rf_rec <-
+  recipe(
+    dh ~ .,
+    data = train_data
+  ) %>%
+  step_dummy(all_nominal(), -all_outcomes(), -nfl_id_off, -nfl_id_def, -game_id, -play_id, one_hot = TRUE) %>%
+  update_role(nfl_id_off, nfl_id_def, game_id, play_id, new_role = "ID") %>% 
+  themis::step_rose(dh)
+
+# RF Workflow
+rf_wf <- workflow() %>% 
+  add_recipe(rf_rec) %>% 
+  add_model(rf_mod)
+
+
+#parallel processing
+doParallel::registerDoParallel()
+
+rf_fit <-
+  rf_wf %>%
+  tune_grid(
+    resamples = train_folds,
+    grid      = 20,
+    metrics   = metric_set(roc_auc, accuracy, sensitivity, specificity),
+    control   = control_resamples(save_pred = TRUE))
+
+rf_fit %>% 
+  collect_metrics() %>% 
+  #filter(.metric == "accuracy") %>%
+  arrange(mtry) 
+  select(mtry, min_n, mean) %>% 
+  pivot_longer(mtry:min_n,
+               names_to = "parameter",
+               values_to = "value") %>% 
+  ggplot(aes(value, mean)) +
+  geom_point() +
+  facet_wrap( ~ parameter, scales = "free_x")
+
+rf_best <- rf_fit %>% 
+  select_best("accuracy")
+
+final_rf_mod <- 
+  finalize_model(rf_mod, rf_best)
+
+final_rf_wf <- 
+  workflow() %>% 
+  add_recipe(rf_rec) %>% 
+  add_model(final_rf_mod)
+
+final_rf_res <- 
+  final_rf_wf %>% 
+  last_fit(data_split)
+
+# final results on holdout set rand forest
+final_rf_res %>% 
+  collect_predictions() %>% 
+  conf_mat(dh, .pred_class)
+
+    
+
+```
+
